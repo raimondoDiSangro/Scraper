@@ -1,3 +1,103 @@
+# GravinaLife Scraper + Local AI Rewriter (Ollama)
+
+Scrapes the top 3 "Più letti" (Most read) articles from https://www.gravinalife.it, rewrites each article with a local Ollama model, and prints the rewritten title and body to the console.
+
+No WordPress/Twitter integration. Pure scrape → rewrite → print.
+
+## Requirements
+
+- Windows (PowerShell examples below)
+- Python 3.9+
+- Packages: `beautifulsoup4`, `requests`
+- Ollama (local LLM server)
+
+## Install Python deps
+
+```powershell
+# from the project folder
+pip install beautifulsoup4 requests
+```
+
+## Install & run Ollama
+
+```powershell
+# 1) Install Ollama: https://ollama.ai
+# 2) Start the server
+ollama serve
+
+# 3) Pull the model used by the script
+ollama pull deepseek-r1:8b
+```
+
+## Optional configuration
+
+The script already has safe defaults. You can override them via environment variables.
+
+```powershell
+# Ollama connection (optional)
+$env:OLLAMA_URL = "http://localhost:11434"
+$env:OLLAMA_MODEL = "deepseek-r1:8b"
+```
+
+## Run
+
+```powershell
+# Using your venv (adjust path if different)
+C:/Users/vince/Scraper/.venv/Scripts/python.exe scraper.py
+
+# Or with your default python
+python scraper.py
+```
+
+## What the script does
+
+1. Downloads the GravinaLife homepage
+2. Finds the sidebar section labeled "Più letti"
+3. Collects the first 3 article links
+4. Fetches each article and extracts paragraphs
+5. Sends title + body to Ollama for rewriting
+6. Prints the rewritten title and body to the console
+
+Notes:
+- The AI prompt explicitly asks for “No bullets or asterisks”
+- The script removes any `<think>...</think>` blocks and code fences from model output
+- It expects the model to return: `title`, blank line, then `body` (falls back gracefully if not)
+
+## Troubleshooting
+
+- Ollama connection/refused
+  - Make sure the server is running:
+    ```powershell
+    ollama serve
+    ```
+  - Verify the URL/env var: `$env:OLLAMA_URL`
+
+- Model not found
+  - Pull it first:
+    ```powershell
+    ollama pull deepseek-r1:8b
+    ```
+
+- "Most read" section not found
+  - The site structure may have changed. Check that the sidebar still contains the text "Più letti".
+
+- Output looks cut/too short
+  - The script lets the model decide length. You can increase output by adding `"num_predict": 2048` in the JSON options where the Ollama request is made.
+
+## File overview
+
+- `scraper.py` – Single file script that does everything inline (fetch → parse → rewrite → print)
+
+## Example (PowerShell)
+
+```powershell
+# optional: tune model and server
+$env:OLLAMA_URL = "http://localhost:11434"
+$env:OLLAMA_MODEL = "deepseek-r1:8b"
+
+# run
+python scraper.py
+```
 # Web Scraper with AI Rewriter & WordPress Publisher
 
 This tool scrapes articles from gravinalife.it, rewrites them using a local AI model (Ollama), and optionally publishes them to your WordPress site.
