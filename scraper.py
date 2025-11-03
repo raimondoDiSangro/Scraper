@@ -23,9 +23,7 @@ STYLE_INSTRUCTIONS = (
     "Rewrite in English with an ironic, confident tone. "
     "Keep all facts, but make it sound natural and human. "
     "Be clear, direct, short, and a bit sarcastic. "
-    "Add a touch of context about the Chiesa del Purgatorio to make it more emotional. "
     "If possible, mention how locals reacted or what they said. "
-    "Suggest what the community could do to avoid such chaos next time. "
     "Vary sentence rhythm so it flows better and keeps readers hooked."
 )
 
