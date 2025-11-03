@@ -9,17 +9,14 @@ import sys
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
-# WordPress Configuration
-WP_SITE_URL = os.getenv("WP_SITE_URL")  # e.g., https://yoursite.com
-WP_USERNAME = os.getenv("WP_USERNAME")  # Your WordPress username
-WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")  # WordPress application password
-WP_PUBLISH = os.getenv("WP_PUBLISH", "false").lower() == "true"  # Set to "true" to auto-publish
+## No social integrations: keep code minimal
 
 # Style: keep it simple - narrative, ironic, clear
-STYLE_INSTRUCTIONS = "Rewrite in English with an ironic, direct tone. " \
-"Keep all information but completely rephrase it so it's unrecognizable from the original." \
-"Be clear, fluent, and highlight human contradictions. Make sure there are no symbols like" \
-"escape characters, code fences, or HTML tags in the output."
+STYLE_INSTRUCTIONS = (
+	"Rewrite in English with an ironic, direct tone. "
+	"Keep all information but completely rephrase it so it's unrecognizable from the original. "
+	"Be clear and fluent. No code fences or HTML tags."
+)
 
 # Store articles here
 articles = []
@@ -127,41 +124,7 @@ def rewrite_article(title, text):
 	return result if result else {"title": title, "body": text}
 
 
-def publish_to_wordpress(title, content):
-	"""Publish article to WordPress using REST API"""
-	if not all([WP_SITE_URL, WP_USERNAME, WP_APP_PASSWORD]):
-		print("[warning] WordPress credentials not configured. Skipping publish.", file=sys.stderr)
-		return False
-	
-	# WordPress REST API endpoint
-	api_url = f"{WP_SITE_URL.rstrip('/')}/wp-json/wp/v2/posts"
-	
-	# Prepare post data
-	post_data = {
-		"title": title,
-		"content": content,
-		"status": "publish" if WP_PUBLISH else "draft",  # publish or save as draft
-	}
-	
-	try:
-		# Send request with basic auth (username + app password)
-		response = requests.post(
-			api_url,
-			json=post_data,
-			auth=(WP_USERNAME, WP_APP_PASSWORD),
-			timeout=30
-		)
-		response.raise_for_status()
-		
-		post_id = response.json().get("id")
-		post_url = response.json().get("link")
-		status = "published" if WP_PUBLISH else "saved as draft"
-		print(f"[success] Article {status}: {post_url}", file=sys.stderr)
-		return True
-		
-	except Exception as e:
-		print(f"[error] WordPress publish failed: {e}", file=sys.stderr)
-		return False
+## Removed all Twitter helpers to keep the script focused on rewriting only
 
 
 # === STEP 1: Get homepage ===
@@ -225,12 +188,18 @@ for idx, article in enumerate(articles, 1):
 	title = article.get('title', '')
 	text = article.get('text', '')
 	
-	# Separator between articles
+	# Separator between articles (for console output)
 	if idx > 1:
 		print("\n" + "="*80 + "\n")
 	
-	# Rewrite and print
+	# Rewrite
 	rewritten = rewrite_article(title, text)
-	print(rewritten.get('title', '').strip())
+	rewritten_title = rewritten.get('title', '').strip()
+	rewritten_body = rewritten.get('body', '').strip()
+	
+	# Print to console
+	print(rewritten_title)
 	print()
-	print(rewritten.get('body', '').strip())
+	print(rewritten_body)
+	
+	# No external publishing: print only
