@@ -126,6 +126,44 @@ def rewrite_article(title, text):
 	result = rewrite_with_ollama(title, text)
 	return result if result else {"title": title, "body": text}
 
+
+def publish_to_wordpress(title, content):
+	"""Publish article to WordPress using REST API"""
+	if not all([WP_SITE_URL, WP_USERNAME, WP_APP_PASSWORD]):
+		print("[warning] WordPress credentials not configured. Skipping publish.", file=sys.stderr)
+		return False
+	
+	# WordPress REST API endpoint
+	api_url = f"{WP_SITE_URL.rstrip('/')}/wp-json/wp/v2/posts"
+	
+	# Prepare post data
+	post_data = {
+		"title": title,
+		"content": content,
+		"status": "publish" if WP_PUBLISH else "draft",  # publish or save as draft
+	}
+	
+	try:
+		# Send request with basic auth (username + app password)
+		response = requests.post(
+			api_url,
+			json=post_data,
+			auth=(WP_USERNAME, WP_APP_PASSWORD),
+			timeout=30
+		)
+		response.raise_for_status()
+		
+		post_id = response.json().get("id")
+		post_url = response.json().get("link")
+		status = "published" if WP_PUBLISH else "saved as draft"
+		print(f"[success] Article {status}: {post_url}", file=sys.stderr)
+		return True
+		
+	except Exception as e:
+		print(f"[error] WordPress publish failed: {e}", file=sys.stderr)
+		return False
+
+
 # === STEP 1: Get homepage ===
 url = "https://www.gravinalife.it"
 page = requests.get(url, timeout=20)
