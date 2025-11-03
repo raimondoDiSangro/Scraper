@@ -1,91 +1,198 @@
 from bs4 import BeautifulSoup
 import requests
+import os
+import json
+import re
+import sys
 
-# empty list to contain the scraped data
-rows = []
+# Configuration
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
-# Open the website (homepage)
+# WordPress Configuration
+WP_SITE_URL = os.getenv("WP_SITE_URL")  # e.g., https://yoursite.com
+WP_USERNAME = os.getenv("WP_USERNAME")  # Your WordPress username
+WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")  # WordPress application password
+WP_PUBLISH = os.getenv("WP_PUBLISH", "false").lower() == "true"  # Set to "true" to auto-publish
+
+# Style: keep it simple - narrative, ironic, clear
+STYLE_INSTRUCTIONS = "Rewrite in English with an ironic, direct tone. " \
+"Keep all information but completely rephrase it so it's unrecognizable from the original." \
+"Be clear, fluent, and highlight human contradictions. Make sure there are no symbols like" \
+"escape characters, code fences, or HTML tags in the output."
+
+# Store articles here
+articles = []
+def extract_json(text):
+	"""Extract JSON from model output (handles code fences and <think> blocks)"""
+	if not text:
+		return None
+	
+	# Clean up the text
+	t = text.strip()
+	
+	# Remove code fences
+	if t.startswith("```"):
+		lines = t.splitlines()
+		t = "\n".join(lines[1:])
+		if t.endswith("```"):
+			t = t[:-3]
+		t = t.strip()
+	
+	# Remove DeepSeek thinking blocks
+	t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL)
+	
+	# Try parsing directly
+	try:
+		return json.loads(t)
+	except:
+		pass
+	
+	# Find JSON in text
+	start = t.find('{')
+	end = t.rfind('}')
+	if start != -1 and end != -1 and end > start:
+		try:
+			return json.loads(t[start:end+1])
+		except:
+			pass
+	
+	return None
+
+
+def rewrite_with_ollama(title, body):
+	"""Send article to Ollama and get rewritten version"""
+	prompt = f"""Titolo: {title}
+Testo: {body}
+
+{STYLE_INSTRUCTIONS}
+
+Restituisci SOLO JSON con chiavi 'title' e 'body'."""
+
+	try:
+		response = requests.post(
+			f"{OLLAMA_URL}/api/generate",
+			json={
+				"model": OLLAMA_MODEL,
+				"prompt": prompt,
+				"stream": False,
+				"format": "json",
+				"options": {
+					"num_predict": 2048,
+					"temperature": 0.7,
+					"num_ctx": 8192,
+				}
+			},
+			timeout=300,
+		)
+		
+		# If generate endpoint doesn't exist, try chat
+		if response.status_code == 404:
+			response = requests.post(
+				f"{OLLAMA_URL}/api/chat",
+				json={
+					"model": OLLAMA_MODEL,
+					"messages": [
+						{"role": "system", "content": "Riscrivi notizie. Rispondi SOLO in JSON."},
+						{"role": "user", "content": prompt}
+					],
+					"stream": False,
+					"format": "json",
+					"options": {"num_predict": 2048, "temperature": 0.7, "num_ctx": 8192}
+				},
+				timeout=300,
+			)
+			response.raise_for_status()
+			content = response.json().get("message", {}).get("content", "").strip()
+		else:
+			response.raise_for_status()
+			content = response.json().get("response", "").strip()
+		
+		# Parse JSON from response
+		parsed = extract_json(content)
+		if parsed:
+			return {"title": parsed.get("title", ""), "body": parsed.get("body", "")}
+		
+		# Fallback if not JSON
+		return {"title": title, "body": content}
+		
+	except Exception as e:
+		print(f"[error] Ollama failed: {e}", file=sys.stderr)
+		return None
+
+
+def rewrite_article(title, text):
+	"""Rewrite article or return original if fails"""
+	result = rewrite_with_ollama(title, text)
+	return result if result else {"title": title, "body": text}
+
+# === STEP 1: Get homepage ===
 url = "https://www.gravinalife.it"
 page = requests.get(url, timeout=20)
-page.raise_for_status()
-page_content = page.text
+soup = BeautifulSoup(page.text, 'html.parser')
 
-# Parse the HTML with BeautifulSoup
-soup = BeautifulSoup(page_content, 'html.parser')
+# === STEP 2: Find "Più letti" section ===
+most_read = soup.find('div', class_='side-title', string='Più letti questa settimana')
+if not most_read:
+	print("Could not find 'Più letti' section")
+	sys.exit(1)
 
-# Find the "Più letti questa settimana" section
-most_read_section = soup.find('div', class_='side-title', string='Più letti questa settimana')
+# Get the article list
+wrapper = most_read.find_parent('div', class_='side-wrapper')
+article_list = wrapper.find('div', class_='side-list')
+top_3 = article_list.find_all('div', class_='side side-text', limit=3)
 
-if not most_read_section:
-	print("Could not find 'Più letti questa settimana' section")
-else:
-	# Get the parent wrapper and then find the side-list
-	side_wrapper = most_read_section.find_parent('div', class_='side-wrapper')
-	if not side_wrapper:
-		print("Could not find wrapper for 'Più letti questa settimana'")
-	else:
-		side_list = side_wrapper.find('div', class_='side-list')
-		if not side_list:
-			print("Could not find list for 'Più letti questa settimana'")
-		else:
-			# Find all article items (first 3)
-			articles = side_list.find_all('div', class_='side side-text', limit=3)
+# === STEP 3: Extract each article ===
+for item in top_3:
+	# Get title
+	sharing = item.find('div', class_='sharing')
+	title = sharing.get('data-title') if sharing and sharing.has_attr('data-title') else None
+	
+	if not title:
+		title_link = item.find('span', class_='title')
+		if title_link and title_link.find('a'):
+			title = title_link.find('a').get_text(strip=True)
+	
+	# Get URL
+	url_link = item.find('span', class_='title')
+	article_url = None
+	if url_link and url_link.find('a'):
+		href = url_link.find('a').get('href')
+		if href:
+			article_url = "https://www.gravinalife.it" + href
+	
+	# Fetch full article text
+	full_text = None
+	if article_url:
+		try:
+			article_page = requests.get(article_url, timeout=20)
+			article_soup = BeautifulSoup(article_page.text, 'html.parser')
+			
+			# Get all paragraph blocks
+			paragraphs = article_soup.select('.p')
+			if not paragraphs:
+				paragraphs = article_soup.select('div.content-wrapper p, article p')
+			
+			text_parts = [p.get_text(" ", strip=True) for p in paragraphs if p.get_text(strip=True)]
+			if text_parts:
+				full_text = "\n\n".join(text_parts)
+		except:
+			pass
+	
+	# Save article
+	articles.append({'title': title, 'text': full_text})
 
-			print("Extracting top 3 most-read articles (title from sharing data-title + first paragraph from article page)\n")
-
-			for i, article in enumerate(articles, 1):
-				# Extract share title from the sharing div's data-title
-				sharing_div = article.find('div', class_='sharing')
-				share_title = None
-				if sharing_div and sharing_div.has_attr('data-title'):
-					share_title = sharing_div.get('data-title')
-
-				# Fallback: use visible title if sharing title not present
-				if not share_title:
-					title_span = article.find('span', class_='title')
-					if title_span and title_span.find('a'):
-						share_title = title_span.find('a').get_text(strip=True)
-
-				# Extract URL (prefer anchor href)
-				article_url = None
-				title_span = article.find('span', class_='title')
-				if title_span and title_span.find('a'):
-					href = title_span.find('a').get('href')
-					if href:
-						article_url = "https://www.gravinalife.it" + href
-				# Fallback: try sharing data-url
-				if not article_url and sharing_div and sharing_div.has_attr('data-url'):
-					article_url = sharing_div.get('data-url')
-
-				# Fetch article page and extract first paragraph content
-				first_paragraph = None
-				if article_url:
-					try:
-						article_page = requests.get(article_url, timeout=20)
-						article_page.raise_for_status()
-						article_soup = BeautifulSoup(article_page.text, 'html.parser')
-						# Select any element that has both classes 'p' and 'first'
-						first_el = article_soup.select_one('.p.first')
-						if first_el:
-							first_paragraph = first_el.get_text(" ", strip=True)
-						else:
-							# Gentle fallback: try the first <p> under a likely content container
-							main_p = article_soup.select_one('div.content-wrapper p, article p')
-							if main_p:
-								first_paragraph = main_p.get_text(" ", strip=True)
-					except Exception as e:
-						first_paragraph = None
-
-				# Print and store
-				print(f"{i}. {share_title or '[No title found]'}")
-				print(f"   URL: {article_url or '[No URL found]'}")
-				print(f"   First paragraph: {first_paragraph or '[No content found]'}\n")
-
-				rows.append({
-					'rank': i,
-					'title': share_title,
-					'url': article_url,
-					'first_paragraph': first_paragraph,
-				})
-
-			print(f"Total articles scraped: {len(rows)}")
+# === STEP 4: Rewrite and print ===
+for idx, article in enumerate(articles, 1):
+	title = article.get('title', '')
+	text = article.get('text', '')
+	
+	# Separator between articles
+	if idx > 1:
+		print("\n" + "="*80 + "\n")
+	
+	# Rewrite and print
+	rewritten = rewrite_article(title, text)
+	print(rewritten.get('title', '').strip())
+	print()
+	print(rewritten.get('body', '').strip())
