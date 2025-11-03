@@ -20,10 +20,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
 STYLE_INSTRUCTIONS = (
-    "Rewrite in English with an ironic, direct tone. "
-    "Keep all information but completely rephrase it so it's unrecognizable from the original. "
-    "Be clear and fluent. No code fences or HTML tags." \
-    "Keep the new article nice and short."
+    "Rewrite in English with an ironic, confident tone. "
+    "Keep all facts, but make it sound natural and human. "
+    "Be clear, direct, short, and a bit sarcastic."
 )
 
 BASE_URL = "https://www.gravinalife.it"
