@@ -1,0 +1,23 @@
+{
+  "website": {
+    "base_url": "https://www.gravinalife.it",
+    "most_read_section_label": "Più letti questa settimana",
+    "selectors": {
+      "section_class": "side-wrapper",
+      "list_class": "side-list",
+      "article_item_class": "side side-text",
+      "article_title_class": "title",
+      "sharing_div_class": "sharing",
+      "article_paragraphs": [".p", "div.content-wrapper p", "article p", ".article-content p", ".content p"]
+    },
+    "articles_limit": 3
+  },
+  "rewriting": {
+    "style_instructions": "Rewrite in English with an ironic, confident tone. Keep all facts, but make it sound natural and human. Be clear, direct, short, and a bit sarcastic. If possible, mention how locals reacted or what they said. Vary sentence rhythm so it flows better and keeps readers hooked."
+  },
+  "claude": {
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 2048,
+    "temperature": 0.7
+  }
+}
