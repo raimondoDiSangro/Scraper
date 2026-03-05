@@ -1,22 +1,40 @@
-# Simple GravinaLife "Most Read" rewriter with Ollama
-# - Scrapes the homepage
-# - Finds the "Most read this week" section
-# - Opens the top 3 articles
-# - Sends title/body to a local Ollama model for rewriting
-# - Prints rewritten title + body to console
+#!/usr/bin/env python3
+"""
+News scraper with AI rewriting via Ollama.
 
-from bs4 import BeautifulSoup
-import requests
-import os
+Supports multiple sites via SiteConfig. Uses trafilatura for article body
+extraction (works on most news sites without custom selectors).
+
+Usage:
+    python scraper.py [--site gravinalife] [--count 3]
+
+Environment variables:
+    OLLAMA_URL    Ollama server URL  (default: http://localhost:11434)
+    OLLAMA_MODEL  Model name         (default: deepseek-r1:8b)
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
+import os
 import re
 import sys
-from typing import Optional  # <-- added for Optional[dict]
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import partial
+from typing import Optional
+from urllib.parse import urljoin
 
-# -----------------------------
-# Configuration
-# -----------------------------
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+import requests
+import trafilatura
+from bs4 import BeautifulSoup
+
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
 STYLE_INSTRUCTIONS = (
@@ -27,105 +45,228 @@ STYLE_INSTRUCTIONS = (
     "Vary sentence rhythm so it flows better and keeps readers hooked."
 )
 
-BASE_URL = "https://www.gravinalife.it"
-MOST_READ_LABEL = "Più letti questa settimana"
+MAX_RETRIES    = 3
+RETRY_DELAY    = 2    # seconds between retries
+FETCH_TIMEOUT  = 20   # seconds
+OLLAMA_TIMEOUT = 300  # seconds
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; news-scraper/2.0)"}
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def extract_json(text: str):
-    """Extract a JSON object from model output (handles code fences and <think> blocks)."""
+# ── Site Configs ───────────────────────────────────────────────────────────────
+
+@dataclass
+class SiteConfig:
+    name: str
+    base_url: str
+    # CSS selector that returns <a> elements linking to articles.
+    # Applied within the section found by section_label, if set.
+    link_selector: str
+    # If the target articles live on a separate page (e.g. /most-read),
+    # set this; otherwise the base_url homepage is fetched.
+    feed_url: str = ""
+    # Narrow the search to a labelled section on the page.
+    # section_selector: CSS selector for the heading/label element.
+    # section_label:    text that element must contain.
+    section_selector: str = ""
+    section_label: str = ""
+    max_articles: int = 3
+
+
+SITES: dict[str, SiteConfig] = {
+    "gravinalife": SiteConfig(
+        name="gravinalife",
+        base_url="https://www.gravinalife.it",
+        link_selector="span.title a",
+        section_selector="div.side-title",
+        section_label="Più letti questa settimana",
+        max_articles=3,
+    ),
+    # ── Add more sites here ────────────────────────────────────────────────
+    #
+    # "example": SiteConfig(
+    #     name="example",
+    #     base_url="https://example-news.com",
+    #     feed_url="https://example-news.com/most-read",   # optional
+    #     link_selector="h2.article-title a",
+    #     max_articles=5,
+    # ),
+}
+
+
+# ── Network helpers ────────────────────────────────────────────────────────────
+
+def fetch_with_retry(url: str, timeout: int = FETCH_TIMEOUT) -> Optional[requests.Response]:
+    """GET a URL, retrying up to MAX_RETRIES times on transient failures."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, timeout=timeout, headers=HEADERS)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            if attempt == MAX_RETRIES:
+                print(f"[error] Failed to fetch {url} after {MAX_RETRIES} attempts: {e}",
+                      file=sys.stderr)
+                return None
+            time.sleep(RETRY_DELAY)
+    return None
+
+
+# ── JSON extraction ────────────────────────────────────────────────────────────
+
+def extract_json(text: str) -> Optional[dict]:
+    """Extract a JSON object from model output.
+
+    Handles:
+    - Markdown code fences (```json ... ```)
+    - DeepSeek <think>...</think> reasoning blocks
+    - JSON embedded inside surrounding prose
+    """
     if not text:
         return None
     t = text.strip()
 
-    # Remove markdown code fences if present (```json ... ```)
+    # Remove markdown code fences
     if t.startswith("```"):
         lines = t.splitlines()
-        t = "\n".join(lines[1:])  # Skip first line with ```
-        if t.endswith("```"):
-            t = t[:-3]  # Remove closing ```
-        t = t.strip()
+        inner = lines[1:]  # drop opening ``` or ```json line
+        if inner and inner[-1].strip() == "```":
+            inner = inner[:-1]  # drop closing ``` line
+        t = "\n".join(inner).strip()
 
     # Remove DeepSeek's <think>...</think> reasoning blocks
     t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL).strip()
 
-    # Try parsing the entire text as JSON
+    # Try the whole string first
     try:
         return json.loads(t)
     except Exception:
         pass
 
-    # If that fails, try extracting just the JSON object between { and }
+    # Fallback: extract the first {...} block
     start = t.find("{")
     end = t.rfind("}")
-    if start != -1 and end != -1 and end > start:
+    if start != -1 and end > start:
         try:
             return json.loads(t[start:end + 1])
         except Exception:
-            return None
+            pass
+
     return None
 
 
+# ── Scraping ───────────────────────────────────────────────────────────────────
+
+def get_article_urls(config: SiteConfig) -> list[str]:
+    """Fetch the site's listing page and return article URLs per the site config."""
+    url = config.feed_url or config.base_url
+    resp = fetch_with_retry(url)
+    if resp is None:
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Narrow to a labelled section when configured
+    search_root = soup
+    if config.section_label and config.section_selector:
+        for el in soup.select(config.section_selector):
+            if config.section_label in el.get_text():
+                parent = el.find_parent()
+                if parent:
+                    search_root = parent
+                break
+
+    links: list[str] = []
+    for a in search_root.select(config.link_selector)[: config.max_articles]:
+        href = (a.get("href") or "").strip()
+        if href:
+            links.append(urljoin(config.base_url, href))
+
+    return links
+
+
+def fetch_article(url: str, config: SiteConfig) -> dict:
+    """Fetch one article URL; return title + body text."""
+    resp = fetch_with_retry(url)
+    if resp is None:
+        return {"title": "", "text": "", "url": url}
+
+    html = resp.text
+
+    # trafilatura handles body extraction on most news sites
+    body = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
+
+    # Get title from trafilatura metadata
+    meta = trafilatura.extract_metadata(html)
+    title = (meta.title or "") if meta else ""
+
+    # Fallback: if trafilatura found nothing, use basic BeautifulSoup extraction
+    if not body:
+        soup = BeautifulSoup(html, "html.parser")
+        h1 = soup.find("h1")
+        title = title or (h1.get_text(strip=True) if h1 else "")
+        paras = soup.select(
+            "article p, .article-content p, .content p, .entry-content p, p"
+        )
+        body = "\n\n".join(
+            p.get_text(" ", strip=True) for p in paras if p.get_text(strip=True)
+        )
+
+    return {"title": title, "text": body, "url": url}
+
+
+# ── Rewriting ──────────────────────────────────────────────────────────────────
+
 def rewrite_with_ollama(title: str, body: str) -> Optional[dict]:
-    """Send article to Ollama; return {'title','body'} on success, else None."""
-    # Build the prompt with original article and rewriting instructions
+    """Send an article to Ollama; return {'title', 'body'} on success, else None."""
     prompt = (
         f"Title: {title}\n"
         f"Body: {body}\n\n"
         f"{STYLE_INSTRUCTIONS}\n\n"
         "Return ONLY JSON with keys 'title' and 'body'."
     )
+    payload_base = {
+        "model": OLLAMA_MODEL,
+        "stream": False,
+        "format": "json",
+        "options": {"num_predict": 2048, "temperature": 0.7, "num_ctx": 8192},
+    }
 
     try:
-        # Try the primary /api/generate endpoint first
         r = requests.post(
             f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",  # Request JSON response format
-                "options": {
-                    "num_predict": 2048,    # Max tokens to generate (conservative for 8B model)
-                    "temperature": 0.7,      # Creativity level
-                    "num_ctx": 8192          # Context window for long articles
-                },
-            },
-            timeout=300,
+            json={**payload_base, "prompt": prompt},
+            timeout=OLLAMA_TIMEOUT,
         )
 
-        # If /api/generate returns 404, fallback to /api/chat endpoint
         if r.status_code == 404:
+            # Older Ollama builds only expose /api/chat
             r = requests.post(
                 f"{OLLAMA_URL}/api/chat",
                 json={
-                    "model": OLLAMA_MODEL,
+                    **payload_base,
                     "messages": [
                         {"role": "system", "content": "Rewrite news. Reply ONLY in JSON."},
-                        {"role": "user", "content": prompt},
+                        {"role": "user",   "content": prompt},
                     ],
-                    "stream": False,
-                    "format": "json",
-                    "options": {"num_predict": 2048, "temperature": 0.7, "num_ctx": 8192},
                 },
-                timeout=300,
+                timeout=OLLAMA_TIMEOUT,
             )
             r.raise_for_status()
             # Chat endpoint returns content in message.content
             content = r.json().get("message", {}).get("content", "").strip()
         else:
             r.raise_for_status()
-            # Generate endpoint returns content in response
             content = r.json().get("response", "").strip()
 
-        # Parse the JSON from the model's response
         parsed = extract_json(content)
         if parsed:
-            return {"title": parsed.get("title", "").strip(), "body": parsed.get("body", "").strip()}
+            return {
+                "title": parsed.get("title", "").strip(),
+                "body":  parsed.get("body",  "").strip(),
+            }
 
-        # If JSON parsing fails, return original title with raw content as body
+        # JSON parsing failed — return raw content as body
         return {"title": title, "body": content.strip()}
 
     except Exception as e:
@@ -133,107 +274,71 @@ def rewrite_with_ollama(title: str, body: str) -> Optional[dict]:
         return None
 
 
-def rewrite_article(title: str, text: str) -> dict:
-    """Rewrite article; on failure, return original."""
-    res = rewrite_with_ollama(title or "", text or "")
-    return res if res else {"title": title or "", "body": text or ""}
+def rewrite_article(article: dict) -> dict:
+    """Rewrite an article dict; fall back to original text on failure."""
+    result = rewrite_with_ollama(article.get("title", ""), article.get("text", ""))
+    if result:
+        return result
+    return {"title": article.get("title", ""), "body": article.get("text", "")}
 
 
-# -----------------------------
-# Main Scrape + Rewrite
-# -----------------------------
-def main():
-    # STEP 1: Fetch the homepage
-    try:
-        resp = requests.get(BASE_URL, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[error] Failed to fetch homepage: {e}", file=sys.stderr)
-        sys.exit(1)
+# ── Output ─────────────────────────────────────────────────────────────────────
 
-    # STEP 2: Parse HTML and find the "Most read this week" section
-    soup = BeautifulSoup(resp.text, "html.parser")
-    most_read_title = soup.find("div", class_="side-title", string=MOST_READ_LABEL)
-    if not most_read_title:
-        print("Could not find 'Most read this week' section", file=sys.stderr)
-        sys.exit(1)
-
-    # Navigate up to the wrapper div containing the article list
-    wrapper = most_read_title.find_parent("div", class_="side-wrapper")
-    if not wrapper:
-        print("Could not find side-wrapper for most read list", file=sys.stderr)
-        sys.exit(1)
-
-    # Find the list container with the articles
-    article_list = wrapper.find("div", class_="side-list")
-    if not article_list:
-        print("Could not find side-list container", file=sys.stderr)
-        sys.exit(1)
-
-    # Extract the top 3 article items from the list
-    items = article_list.find_all("div", class_="side side-text", limit=3)
-    if not items:
-        print("No articles found in most read list", file=sys.stderr)
-        sys.exit(1)
-
-    # STEP 3: Extract title, URL, and full body text for each article
-    articles = []
-    for it in items:
-        # Extract the article title
-        title = ""
-        # First try to get title from the sharing div's data-title attribute
-        sharing = it.find("div", class_="sharing")
-        if sharing and sharing.has_attr("data-title"):
-            title = (sharing.get("data-title") or "").strip()
-        # If not found, fallback to the link text
-        if not title:
-            tspan = it.find("span", class_="title")
-            if tspan and tspan.find("a"):
-                title = tspan.find("a").get_text(strip=True)
-
-        # Extract the article URL
-        article_url = ""
-        tspan = it.find("span", class_="title")
-        if tspan and tspan.find("a"):
-            href = (tspan.find("a").get("href") or "").strip()
-            if href:
-                article_url = BASE_URL + href
-
-        # Fetch and extract the full article body
-        full_text = ""
-        if article_url:
-            try:
-                ap = requests.get(article_url, timeout=20)
-                ap.raise_for_status()
-                asoup = BeautifulSoup(ap.text, "html.parser")
-                
-                # Try to find paragraphs with class .p first (site-specific)
-                paras = asoup.select(".p")
-                # If not found, try common paragraph selectors
-                if not paras:
-                    paras = asoup.select("div.content-wrapper p, article p, .article-content p, .content p")
-                
-                # Extract text from all paragraphs and join with double newlines
-                parts = [p.get_text(" ", strip=True) for p in paras if p.get_text(strip=True)]
-                full_text = "\n\n".join(parts) if parts else ""
-            except Exception:
-                full_text = ""
-
-        articles.append({"title": title, "text": full_text})
-
-    # STEP 4: Rewrite each article with Ollama and print the results
-    for idx, art in enumerate(articles, 1):
-        # Print separator between articles (not before the first one)
+def print_results(results: list[dict]) -> None:
+    for idx, res in enumerate(results, 1):
         if idx > 1:
             print("\n" + "=" * 80 + "\n")
-        
-        # Send article to Ollama for rewriting
-        rewritten = rewrite_article(art.get("title", ""), art.get("text", ""))
-        
-        # Print the rewritten title and body
-        print(rewritten.get("title", "").strip())
+        print(res.get("title", "").strip())
         print()
-        print(rewritten.get("body", "").strip())
+        print(res.get("body", "").strip())
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Scrape and rewrite news articles with Ollama.",
+    )
+    parser.add_argument(
+        "--site",
+        choices=list(SITES.keys()),
+        default=list(SITES.keys())[0],
+        help=f"Site to scrape. Available: {', '.join(SITES.keys())} (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        help="Number of articles to fetch (overrides the site config default).",
+    )
+    args = parser.parse_args()
+
+    config = SITES[args.site]
+    max_articles = args.count if args.count else config.max_articles
+
+    # Step 1 — collect article URLs
+    print(f"[info] Fetching article list from {config.feed_url or config.base_url} ...",
+          file=sys.stderr)
+    urls = get_article_urls(config)
+    if not urls:
+        print("[error] No article URLs found.", file=sys.stderr)
+        sys.exit(1)
+    urls = urls[:max_articles]
+    print(f"[info] Found {len(urls)} article(s).", file=sys.stderr)
+
+    # Step 2 — fetch all articles in parallel
+    _fetch = partial(fetch_article, config=config)
+    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+        articles = list(pool.map(_fetch, urls))
+
+    # Step 3 — rewrite sequentially (Ollama is typically single-GPU)
+    results = []
+    for art in articles:
+        print(f"[info] Rewriting: {art.get('title') or art.get('url', '')}",
+              file=sys.stderr)
+        results.append(rewrite_article(art))
+
+    # Step 4 — print
+    print_results(results)
 
 
 if __name__ == "__main__":
